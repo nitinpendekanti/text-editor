@@ -1,5 +1,9 @@
 /*** includes ***/
 
+#define _DEFAULT_SOURCE
+#define _BSD_SOURCE
+#define _GNU_SOURCE
+
 #include <iostream>
 #include <unistd.h>     // read() and STDIN_FILENO
 #include <termios.h>    // struct termios, tcgetattr(), tcsetattr(), ISIG, ICANON, TCAFLUSH
@@ -9,6 +13,7 @@
 #include <sys/ioctl.h>
 #include <string.h>
 #include <algorithm>
+#include <sys/types.h>
 
 /*** defines ***/
 
@@ -30,11 +35,19 @@ enum editorKey {
 
 /*** data ***/
 
+using erow = struct erow {
+    int size;
+    char *chars;
+};
+
 struct editorConfig {
     int cx;
     int cy;
     int screenrows;
     int screencols;
+    int numrows;
+    int rowoff;
+    erow* row;
     struct termios orig_termios;
 };
 
@@ -171,6 +184,41 @@ int getWindowSize(int *rows, int *cols) {
     }
 }
 
+/*** row operations ***/
+
+void editorAppendRow(char* s, size_t len) {
+    E.row = (erow*)realloc(E.row, sizeof(erow) * (E.numrows + 1));
+
+    int idx = E.numrows;
+    E.row[idx].size = len;
+    E.row[idx].chars = (char*)malloc(len + 1);
+    memcpy(E.row[idx].chars, s, len);
+    E.row[idx].chars[len] = '\0';
+    E.numrows++;
+}
+
+/*** file i/o ***/
+
+void editorOpen(char* filename) {
+    FILE *fp = fopen(filename, "r");
+    if (!fp) die("fopen");
+
+    char *line {NULL};
+    size_t linecap {0};
+    ssize_t linelen;
+    while ((linelen = getline(&line, &linecap, fp)) != -1) {
+        if (linelen != -1) {
+            while (linelen > 0 && 
+                (line[linelen - 1] == '\n' || line[linelen - 1] == '\r')) --linelen;
+            
+            editorAppendRow(line, linelen);
+        }
+    }
+
+    free(line);
+    fclose(fp);
+}
+
 /*** append buffer ***/
 
 struct abuf {
@@ -197,22 +245,28 @@ void abFree(struct abuf *ab) {
 
 void editorDrawRows(struct abuf* ab) {
     for (int y = 0; y < E.screenrows; ++y) {
-        if (y != E.screenrows / 3) {
-            abAppend(ab, "~", 1);         // tilde indicating start of line
-        } else {
-            char welcomeMsg[80];
-            int welcomeMsgLen = snprintf(welcomeMsg, sizeof(welcomeMsg), "Nilo Editor -- version %s", NILO_VESION);
+        int filerow = y + E.rowoff;
+        if (filerow >= E.numrows) {
+            if (y != E.screenrows / 3 || E.numrows != 0) {
+                abAppend(ab, "~", 1);      // tilde indicating start of line
+            } else {
+                char welcomeMsg[80];
+                int welcomeMsgLen = snprintf(welcomeMsg, sizeof(welcomeMsg), "Nilo Editor -- version %s", NILO_VESION);
 
-            // add padding to center welcome message
-            int padding = (E.screencols - welcomeMsgLen) / 2;
-            if (padding) {
-                abAppend(ab, "~", 1);
-                --padding;
+                // add padding to center welcome message
+                int padding = (E.screencols - welcomeMsgLen) / 2;
+                if (padding) {
+                    abAppend(ab, "~", 1);
+                    --padding;
+                }
+                while (padding--) abAppend(ab, " ", 1);
+
+                welcomeMsgLen = std::min(welcomeMsgLen, E.screencols);
+                abAppend(ab, welcomeMsg, welcomeMsgLen);
             }
-            while (padding--) abAppend(ab, " ", 1);
-
-            welcomeMsgLen = std::min(welcomeMsgLen, E.screencols);
-            abAppend(ab, welcomeMsg, welcomeMsgLen);
+        } else {
+            int len = std::min(E.row[filerow].size, E.screencols);
+            abAppend(ab, E.row[filerow].chars, len);
         }
         
         abAppend(ab, "\x1b[K", 3);       // clear a row before drawing
@@ -298,14 +352,20 @@ void editorProcessKeypress() {
 void initEditor() {
     E.cx = 0;
     E.cy = 0;
+    E.numrows = 0;
+    E.rowoff = 0;
+    E.row = nullptr;
 
     if (getWindowSize(&E.screenrows, &E.screencols) == -1) die("getWindowSize");
 }
 
-int main() {
+int main(int argc, char* argv[]) {
     enableRawMode();
     initEditor();
-
+    if (argc > 1) {
+        editorOpen(argv[1]);
+    }
+    
     while (true) {
         editorRefreshScreen();
         editorProcessKeypress();
