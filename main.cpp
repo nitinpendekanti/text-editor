@@ -18,6 +18,7 @@
 /*** defines ***/
 
 #define NILO_VESION "0.0.1"
+#define NILO_TAB_STOP 8
 
 #define CTRL_KEY(k) ((k) & 0x1f)
 
@@ -38,15 +39,18 @@ enum editorKey {
 using erow = struct erow {
     int size;
     char *chars;
+    int rsize;
+    char *render;
 };
 
 struct editorConfig {
-    int cx;
-    int cy;
+    int cx, cy;
+    int rx;
     int screenrows;
     int screencols;
     int numrows;
     int rowoff;
+    int coloff;
     erow* row;
     struct termios orig_termios;
 };
@@ -183,8 +187,41 @@ int getWindowSize(int *rows, int *cols) {
         return 0;
     }
 }
-
+                
 /*** row operations ***/
+
+int editorRowCxToRx(erow *row, int cx) {
+    int rx = 0;
+    for (int j = 0; j < cx; ++j) {
+        if (row->chars[j] == '\t')
+            rx += (NILO_TAB_STOP - 1) - (rx % NILO_TAB_STOP);
+        ++rx;
+    }
+    return rx;
+}
+
+void editorUpdateRow(erow *row) {
+    int tabs {0};
+    for (int j = 0; j < row->size; ++j) {
+        if (row->chars[j] == '\t') ++tabs;
+    }
+
+    free(row->render);
+    row->render = (char*)malloc(row->size + (tabs * (NILO_TAB_STOP - 1)) + 1);
+
+    int idx {0};
+    for (int j = 0; j < row->size; ++j) {
+        if (row->chars[j] == '\t') {
+            row->render[idx++] = ' ';
+            while (idx % NILO_TAB_STOP != 0) row->render[idx++] = ' ';
+        } else {
+            row->render[idx++] = row->chars[j];
+        }
+    }
+
+    row->render[idx] = '\0';
+    row->rsize = idx;
+}
 
 void editorAppendRow(char* s, size_t len) {
     E.row = (erow*)realloc(E.row, sizeof(erow) * (E.numrows + 1));
@@ -194,6 +231,11 @@ void editorAppendRow(char* s, size_t len) {
     E.row[idx].chars = (char*)malloc(len + 1);
     memcpy(E.row[idx].chars, s, len);
     E.row[idx].chars[len] = '\0';
+
+    E.row[idx].rsize = 0;
+    E.row[idx].render = NULL;
+    editorUpdateRow(&E.row[idx]);
+
     E.numrows++;
 }
 
@@ -243,6 +285,27 @@ void abFree(struct abuf *ab) {
 
 /*** output ***/
 
+void editorScroll() {
+    E.rx = 0;
+    if (E.cy < E.numrows) {
+        E.rx = editorRowCxToRx(&E.row[E.cy], E.cx);
+    }
+
+    // handle vertical scrolling
+    if (E.cy < E.rowoff) { 
+        E.rowoff = E.cy;
+    } else if(E.cy >= E.rowoff + E.screenrows) {
+        E.rowoff = E.cy - E.screenrows + 1;
+    }
+
+    // handle horizontal scrolling
+    if (E.rx < E.coloff) {
+        E.coloff = E.rx;
+    } else if(E.rx >= E.coloff + E.screencols) {
+        E.coloff = E.rx - E.screencols + 1;
+    }
+}
+
 void editorDrawRows(struct abuf* ab) {
     for (int y = 0; y < E.screenrows; ++y) {
         int filerow = y + E.rowoff;
@@ -265,8 +328,10 @@ void editorDrawRows(struct abuf* ab) {
                 abAppend(ab, welcomeMsg, welcomeMsgLen);
             }
         } else {
-            int len = std::min(E.row[filerow].size, E.screencols);
-            abAppend(ab, E.row[filerow].chars, len);
+            int len = E.row[filerow].rsize - E.coloff;
+            len = std::max(0, len);
+            len = std::min(len, E.screencols);
+            abAppend(ab, &E.row[filerow].render[E.coloff], len);
         }
         
         abAppend(ab, "\x1b[K", 3);       // clear a row before drawing
@@ -277,6 +342,8 @@ void editorDrawRows(struct abuf* ab) {
 }
 
 void editorRefreshScreen() {
+    editorScroll();
+
     struct abuf ab = ABUF_INIT;          // append buffer
 
     abAppend(&ab, "\x1b[?25l", 6);       // hide cursor before clearing the screen
@@ -285,7 +352,7 @@ void editorRefreshScreen() {
     editorDrawRows(&ab);                 // draw rows
 
     char buf[32];
-    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.cy + 1, E.cx + 1);
+    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cy - E.rowoff) + 1, (E.rx - E.coloff) + 1);
     abAppend(&ab, buf, strlen(buf));
     
     abAppend(&ab, "\x1b[?25h", 6);       // display cursor after clearing the screen
@@ -302,14 +369,32 @@ void editorMoveCursor(int key) {
             E.cy = std::max(E.cy - 1, 0);
             break;
         case ARROW_LEFT:
-            E.cx = std::max(E.cx - 1, 0);
+            if (E.cx == 0 && E.cy > 0) {
+                --E.cy;
+                E.cx = E.row[E.cy].size;
+            } else {
+                E.cx = std::max(E.cx - 1, 0);
+            }
+
             break;
         case ARROW_DOWN:
-            E.cy = std::min(E.cy + 1, E.screenrows - 1);
+            E.cy = std::min(E.cy + 1, E.numrows);
             break;
         case ARROW_RIGHT:
-            E.cx = std::min(E.cx + 1, E.screencols - 1);
+            if (E.cx < E.row[E.cy].size) {
+                E.cx++;
+            } else if (E.cy < E.numrows) {
+                E.cy++;
+                E.cx = 0;
+            }
             break;
+        
+    }
+
+    erow* row = (E.cy >= E.numrows) ? NULL : &E.row[E.cy];
+    int rowlen = row ? row->size : 0;
+    if (E.cx > rowlen) {
+        E.cx = rowlen;
     }
 }
 
@@ -351,9 +436,11 @@ void editorProcessKeypress() {
 
 void initEditor() {
     E.cx = 0;
+    E.rx = 0;
     E.cy = 0;
     E.numrows = 0;
     E.rowoff = 0;
+    E.coloff = 0;
     E.row = nullptr;
 
     if (getWindowSize(&E.screenrows, &E.screencols) == -1) die("getWindowSize");
