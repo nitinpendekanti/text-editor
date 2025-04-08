@@ -51,6 +51,7 @@ struct editorConfig {
     int numrows;
     int rowoff;
     int coloff;
+    char* filename;
     erow* row;
     struct termios orig_termios;
 };
@@ -242,6 +243,9 @@ void editorAppendRow(char* s, size_t len) {
 /*** file i/o ***/
 
 void editorOpen(char* filename) {
+    free(E.filename);
+    E.filename = strdup(filename);
+
     FILE *fp = fopen(filename, "r");
     if (!fp) die("fopen");
 
@@ -284,6 +288,29 @@ void abFree(struct abuf *ab) {
 }
 
 /*** output ***/
+
+void editorDrawStatusBar(struct abuf* ab) {
+    abAppend(ab, "\x1b[7m", 4);     // invert colors
+
+    char status[80], rstatus[80];
+
+    int len = snprintf(status, sizeof(status), "%.20s - %d lines", E.filename ? E.filename : "[No Name]", E.numrows);
+    len = std::min(len, E.screencols);
+
+    int rlen = snprintf(rstatus, sizeof(rstatus), "%d/%d", E.cy + 1, E.numrows);
+
+    abAppend(ab, status, len);
+
+    for (int i = len; i < E.screencols; ++i) {
+        if (i == E.screencols - rlen) {
+            abAppend(ab, rstatus, rlen);
+            break;
+        }
+
+        abAppend(ab, " ", 1);
+    }
+    abAppend(ab, "\x1b[m", 4);      // restore color
+}
 
 void editorScroll() {
     E.rx = 0;
@@ -335,9 +362,7 @@ void editorDrawRows(struct abuf* ab) {
         }
         
         abAppend(ab, "\x1b[K", 3);       // clear a row before drawing
-        if (y < E.screenrows - 1) {
-            abAppend(ab, "\r\n", 2);     // cairrage return + new line (excluding last line)
-        }
+        abAppend(ab, "\r\n", 2);         // carriage return + new line
     }
 }
 
@@ -350,6 +375,7 @@ void editorRefreshScreen() {
     abAppend(&ab, "\x1b[H", 3);          // reposition cursor to the top-left
 
     editorDrawRows(&ab);                 // draw rows
+    editorDrawStatusBar(&ab);            // draw status bar
 
     char buf[32];
     snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cy - E.rowoff) + 1, (E.rx - E.coloff) + 1);
@@ -448,8 +474,10 @@ void initEditor() {
     E.rowoff = 0;
     E.coloff = 0;
     E.row = nullptr;
+    E.filename = nullptr;
 
     if (getWindowSize(&E.screenrows, &E.screencols) == -1) die("getWindowSize");
+    --E.screenrows; // last line is a status bar
 }
 
 int main(int argc, char* argv[]) {
